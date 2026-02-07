@@ -6,35 +6,28 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chromedp/chromedp"
 	"github.com/joho/godotenv"
-	"gopkg.in/gomail.v2"
+)
+
+// 全局變數：預先啟動的瀏覽器
+var (
+	browserAllocCtx context.Context
+	browserCancel   context.CancelFunc
+	browserMutex    sync.Mutex // 保護瀏覽器的並發訪問
 )
 
 // Config 儲存從環境變數載入的應用程式設定
 type Config struct {
-	TargetURL      string
-	RecipientEmail string
-	SenderEmail    string
-	SenderPassword string
-	SmtpHost       string
-	SmtpPort       int
-	CheckInterval  time.Duration // in seconds
+	TargetURL     string
+	CheckInterval time.Duration // in seconds
 }
 
 // loadConfig 從環境變數讀取設定
 func loadConfig() (*Config, error) {
-	portStr := os.Getenv("SMTP_PORT")
-	if portStr == "" {
-		portStr = "587" // Default SMTP port
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return nil, &configError{"SMTP_PORT 必須是有效的數字"}
-	}
-
 	intervalStr := os.Getenv("CHECK_INTERVAL_SECONDS")
 	if intervalStr == "" {
 		intervalStr = "60" // Default to 60 seconds
@@ -45,29 +38,12 @@ func loadConfig() (*Config, error) {
 	}
 
 	config := &Config{
-		TargetURL:      os.Getenv("TARGET_URL"),
-		RecipientEmail: os.Getenv("RECIPIENT_EMAIL"),
-		SenderEmail:    os.Getenv("SENDER_EMAIL"),
-		SenderPassword: strings.ReplaceAll(os.Getenv("SENDER_PASSWORD"), " ", ""),
-		SmtpHost:       os.Getenv("SMTP_HOST"),
-		SmtpPort:       port,
-		CheckInterval:  time.Duration(interval) * time.Second,
+		TargetURL:     os.Getenv("TARGET_URL"),
+		CheckInterval: time.Duration(interval) * time.Second,
 	}
 
 	if config.TargetURL == "" {
 		return nil, &configError{"環境變數 TARGET_URL 未設定"}
-	}
-	if config.RecipientEmail == "" {
-		return nil, &configError{"環境變數 RECIPIENT_EMAIL 未設定"}
-	}
-	if config.SenderEmail == "" {
-		return nil, &configError{"環境變數 SENDER_EMAIL 未設定"}
-	}
-	if config.SenderPassword == "" {
-		return nil, &configError{"環境變數 SENDER_PASSWORD 未設定 (提示: 如果使用 Gmail，請使用應用程式密碼)"}
-	}
-	if config.SmtpHost == "" {
-		return nil, &configError{"環境變數 SMTP_HOST 未設定 (例如: smtp.gmail.com)"}
 	}
 
 	return config, nil
@@ -82,21 +58,35 @@ func (e *configError) Error() string {
 	return e.message
 }
 
+// initBrowser 預先初始化瀏覽器
+func initBrowser() {
+	browserMutex.Lock()
+	defer browserMutex.Unlock()
+
+	// 如果已經有瀏覽器在運行，先關閉它
+	if browserCancel != nil {
+		browserCancel()
+	}
+
+	// Chrome 啟動參數（WARP 在系統層級運作，不需要額外設定代理）
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", true),
+		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("no-sandbox", true),
+	)
+
+	browserAllocCtx, browserCancel = chromedp.NewExecAllocator(context.Background(), opts...)
+	log.Println("✓ 瀏覽器已預先初始化（系統網路已透過 WARP），隨時待命")
+}
+
 // checkTicketAvailability 使用 Headless Chrome 檢查拓元網站上是否有票
 func checkTicketAvailability(url string) (bool, error) {
 	log.Println("正在使用 Headless Chrome 檢查網址:", url)
 
-	// 設定 Headless Chrome 的選項
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true), // 設定為 false 可看到瀏覽器畫面，方便除錯
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("no-sandbox", true), // 在某些環境下（如 Docker）需要
-	)
-	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer cancel()
-
-	// 建立一個新的 chromedp context
-	ctx, cancel := chromedp.NewContext(allocCtx)
+	// 使用預先啟動的瀏覽器
+	browserMutex.Lock()
+	ctx, cancel := chromedp.NewContext(browserAllocCtx)
+	browserMutex.Unlock()
 	defer cancel()
 
 	// 設定一個總體操作的超時時間
@@ -147,32 +137,97 @@ func checkTicketAvailability(url string) (bool, error) {
 	return false, nil
 }
 
-// sendEmailNotification 發送郵件通知
-func sendEmailNotification(config *Config) error {
-	log.Println("準備發送 Email 通知至:", config.RecipientEmail)
+// autoFillAndWaitForCaptcha 自動填寫表單並等待用戶輸入驗證碼
+func autoFillAndWaitForCaptcha(ticketURL string) error {
+	log.Println("========== 找到票了！立即打開瀏覽器... ==========")
 
-	m := gomail.NewMessage()
-	m.SetHeader("From", config.SenderEmail)
-	m.SetHeader("To", config.RecipientEmail)
-	m.SetHeader("Subject", "【拓元搶票通知】偵測到有票！")
-	m.SetBody("text/html", `
-		<html>
-		<body>
-		<h2>偵測到有票的區域！</h2>
-		<p>拓元售票網站上偵測到「剩餘」或「熱賣中」的票區，請立即前往搶票！</p>
-		<p><strong>網址:</strong> <a href="`+config.TargetURL+`">`+config.TargetURL+`</a></p>
-		<p>祝您搶票順利！</p>
-		</body>
-		</html>
-	`)
+	// 嘗試多個常見的 Chrome 路徑
+	chromePaths := []string{
+		"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+		"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+	}
 
-	d := gomail.NewDialer(config.SmtpHost, config.SmtpPort, config.SenderEmail, config.SenderPassword)
+	var chromePath string
+	for _, path := range chromePaths {
+		if _, err := os.Stat(path); err == nil {
+			chromePath = path
+			break
+		}
+	}
 
-	if err := d.DialAndSend(m); err != nil {
+	// 使用系統的 Chrome（WARP 在系統層級運作）
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", false), // 可見模式
+		chromedp.Flag("disable-gpu", false),
+	)
+
+	if chromePath != "" {
+		opts = append(opts, chromedp.ExecPath(chromePath))
+		log.Printf("使用 Chrome: %s", chromePath)
+	}
+
+	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer cancel()
+
+	ctx, cancel := chromedp.NewContext(allocCtx)
+	defer cancel()
+
+	// 增加超時時間，讓用戶有時間輸入驗證碼
+	ctx, cancel = context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+
+	log.Println("正在導航到選票頁面...")
+
+	err := chromedp.Run(ctx,
+		// 導航到選票頁面
+		chromedp.Navigate(ticketURL),
+		// 等待表單載入
+		chromedp.WaitVisible(`#ticketPriceList`, chromedp.ByQuery),
+		chromedp.Sleep(500*time.Millisecond),
+
+		// 使用 JavaScript 自動找到第一個票價 select 並選擇 1 張票
+		chromedp.Evaluate(`
+			(() => {
+				// 找到所有票價選擇器
+				const selects = document.querySelectorAll('select[name^="TicketForm[ticketPrice]"]');
+				if (selects.length > 0) {
+					// 選擇第一個（通常是全票）
+					selects[0].value = "1";
+					selects[0].dispatchEvent(new Event('change', { bubbles: true }));
+					console.log('已選擇 1 張票:', selects[0].id);
+					return true;
+				}
+				return false;
+			})()
+		`, nil),
+		chromedp.Sleep(300*time.Millisecond),
+
+		// 自動勾選同意條款
+		chromedp.Click(`#TicketForm_agree`, chromedp.ByQuery),
+		chromedp.Sleep(300*time.Millisecond),
+
+		// 將焦點移到驗證碼輸入框
+		chromedp.Focus(`#TicketForm_verifyCode`, chromedp.ByQuery),
+	)
+
+	if err != nil {
+		log.Printf("自動填寫表單時發生錯誤: %v", err)
 		return err
 	}
 
-	log.Println("Email 通知已成功發送！")
+	log.Println("=========================================")
+	log.Println("已自動完成以下步驟：")
+	log.Println("✓ 選擇 1 張票")
+	log.Println("✓ 勾選同意條款")
+	log.Println("✓ 焦點已移至驗證碼輸入框")
+	log.Println("")
+	log.Println("請立即輸入驗證碼並點擊【確認張數】按鈕！")
+	log.Println("=========================================")
+
+	// 保持瀏覽器開啟，等待用戶操作
+	// 這裡可以選擇等待一段時間或直接返回讓程式繼續監控
+	time.Sleep(3 * time.Minute) // 給用戶 3 分鐘時間完成購票
+
 	return nil
 }
 
@@ -184,14 +239,27 @@ func main() {
 		log.Println("提示: 未找到 .env 檔案，將只從系統環境變數讀取。")
 	}
 
-	log.Println("啟動搶票偵測器...")
+	log.Println("=========================================")
+	log.Println("🚀 啟動拓元搶票偵測器...")
+	log.Println("=========================================")
 
 	config, err := loadConfig()
 	if err != nil {
 		log.Fatalf("錯誤: 無法載入設定: %v", err)
 	}
 
-	log.Printf("設定載入成功。每 %v 檢查一次。", config.CheckInterval)
+	log.Printf("✓ 設定載入成功")
+	log.Printf("✓ 監控網址: %s", config.TargetURL)
+	log.Printf("✓ 檢查間隔: %v", config.CheckInterval)
+	log.Println("=========================================\n")
+
+	// 預先初始化瀏覽器，加快響應速度
+	initBrowser()
+	defer func() {
+		if browserCancel != nil {
+			browserCancel()
+		}
+	}()
 
 	// 使用 for-loop 和 Ticker 進行定期檢查
 	ticker := time.NewTicker(config.CheckInterval)
@@ -214,11 +282,17 @@ func runCheck(config *Config) {
 	}
 
 	if available {
-		log.Println("找到票了！正在發送通知...")
-		if err := sendEmailNotification(config); err != nil {
-			log.Printf("發送 Email 時發生錯誤: %v", err)
+		log.Println("🎫 偵測到有票！正在啟動自動搶票流程...")
+
+		// 直接打開瀏覽器並自動填寫表單
+		if err := autoFillAndWaitForCaptcha(config.TargetURL); err != nil {
+			log.Printf("自動填寫失敗: %v", err)
+			log.Println("請手動前往:", config.TargetURL)
 		} else {
-			log.Println("通知已發送，將繼續監控直到手動關閉程式 (Ctrl+C)。")
+			log.Println("已完成自動填寫，等待您完成購票。")
 		}
+
+		// 購票流程完成後，可以選擇結束程式或繼續監控
+		log.Println("提示: 如需繼續監控其他場次，請保持程式運行。")
 	}
 }
