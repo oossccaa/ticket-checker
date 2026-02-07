@@ -82,7 +82,7 @@ func (e *configError) Error() string {
 	return e.message
 }
 
-// checkTicketAvailability 使用 Headless Chrome 檢查網站上是否有票
+// checkTicketAvailability 使用 Headless Chrome 檢查拓元網站上是否有票
 func checkTicketAvailability(url string) (bool, error) {
 	log.Println("正在使用 Headless Chrome 檢查網址:", url)
 
@@ -103,28 +103,48 @@ func checkTicketAvailability(url string) (bool, error) {
 	ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	// 執行任務：導航至頁面，並等待 '.nextBtn' 元素出現
+	var fontTexts []string
+
+	// 執行任務：導航至頁面，等待票區列表載入，然後取得所有 font 元素的文字
 	err := chromedp.Run(ctx,
 		chromedp.Navigate(url),
-		// 等待 '.nextBtn' 元素變得可見。
-		// 如果在 context 的超時時間內 (30秒) 沒有出現，將會返回一個 timeout 錯誤。
-		chromedp.WaitVisible(`.nextBtn`, chromedp.ByQuery),
+		// 等待第一個票區群組出現
+		chromedp.WaitVisible(`#group_0`, chromedp.ByQuery),
+		// 取得 group_0 到 group_6 中所有 font 元素的文字內容
+		chromedp.Evaluate(`
+			(() => {
+				let texts = [];
+				for (let i = 0; i <= 6; i++) {
+					let group = document.getElementById('group_' + i);
+					if (group) {
+						let fonts = group.querySelectorAll('font');
+						fonts.forEach(f => texts.push(f.textContent));
+					}
+				}
+				return texts;
+			})()
+		`, &fontTexts),
 	)
 
 	if err != nil {
-		// 當元素在指定時間內未找到時，會觸發 context deadline exceeded 錯誤，這是預期行為。
 		if strings.Contains(err.Error(), "context deadline exceeded") {
-			log.Println("在指定時間內未找到 '.nextBtn' 按鈕。")
-			return false, nil // 這不是一個嚴重錯誤，僅表示按鈕不存在
+			log.Println("在指定時間內未找到票區列表。")
+			return false, nil
 		}
-		// 如果是其他錯誤 (例如網路問題、Chrome無法啟動)，則記錄下來
 		log.Printf("Headless Chrome 檢查時發生錯誤: %v", err)
 		return false, err
 	}
 
-	// 如果程式碼能執行到這裡，代表 err 是 nil，表示 WaitVisible 成功，按鈕已找到。
-	log.Println("成功找到 '.nextBtn' 按鈕!")
-	return true, nil
+	// 檢查是否有任何 font 包含 "剩餘" 或 "熱賣中" 關鍵字
+	for _, text := range fontTexts {
+		if strings.Contains(text, "剩餘") || strings.Contains(text, "熱賣中") {
+			log.Printf("找到有票的區域: %s", text)
+			return true, nil
+		}
+	}
+
+	log.Printf("檢查了 %d 個票區，目前都已售完。", len(fontTexts))
+	return false, nil
 }
 
 // sendEmailNotification 發送郵件通知
@@ -134,12 +154,12 @@ func sendEmailNotification(config *Config) error {
 	m := gomail.NewMessage()
 	m.SetHeader("From", config.SenderEmail)
 	m.SetHeader("To", config.RecipientEmail)
-	m.SetHeader("Subject", "【搶票通知】可能有票了！")
+	m.SetHeader("Subject", "【拓元搶票通知】偵測到有票！")
 	m.SetBody("text/html", `
 		<html>
 		<body>
-		<h2>偵測到搶票按鈕！</h2>
-		<p>您關注的網站上可能已經可以購票了，請立即前往確認！</p>
+		<h2>偵測到有票的區域！</h2>
+		<p>拓元售票網站上偵測到「剩餘」或「熱賣中」的票區，請立即前往搶票！</p>
 		<p><strong>網址:</strong> <a href="`+config.TargetURL+`">`+config.TargetURL+`</a></p>
 		<p>祝您搶票順利！</p>
 		</body>
@@ -198,8 +218,7 @@ func runCheck(config *Config) {
 		if err := sendEmailNotification(config); err != nil {
 			log.Printf("發送 Email 時發生錯誤: %v", err)
 		} else {
-			log.Println("通知已發送，程式將結束。")
-			os.Exit(0) // 成功發送後結束程式，避免重複通知
+			log.Println("通知已發送，將繼續監控直到手動關閉程式 (Ctrl+C)。")
 		}
 	}
 }
